@@ -67,6 +67,10 @@ final class MeetingController: ObservableObject {
     private var sysRestartAttempts = 0
     private var sysRestartCooldown = 0
 
+    // ordered transcription queue
+    private var pending: [PendingChunk] = []
+    private var drainTask: Task<Void, Never>?
+
     init(transcriber: Transcriber) {
         self.transcriber = transcriber
     }
@@ -113,6 +117,7 @@ final class MeetingController: ObservableObject {
         lines.removeAll()
         micOffset = 0; sysOffset = 0
         fullSysAudio.removeAll()
+        pending.removeAll()
         // fix the checkpoint file at start so every save hits the same path
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("OpenWispr", isDirectory: true)
@@ -242,8 +247,9 @@ final class MeetingController: ObservableObject {
         status = "pausing…"
         let micTail = mic.stop()
         let sysTail = await system.stop()
-        await ingest(micTail, speaker: "You", stream: .mic)
-        await ingest(sysTail, speaker: "Others", stream: .system)
+        enqueue(micTail, speaker: "You", stream: .mic)
+        enqueue(sysTail, speaker: "Others", stream: .system)
+        await flushPending()
         status = "paused"
     }
 
@@ -277,10 +283,13 @@ final class MeetingController: ObservableObject {
         if !isPaused {
             let micTail = mic.stop()
             let sysTail = await system.stop()
-            await ingest(micTail, speaker: "You", stream: .mic)
-            await ingest(sysTail, speaker: "Others", stream: .system)
+            enqueue(micTail, speaker: "You", stream: .mic)
+            enqueue(sysTail, speaker: "Others", stream: .system)
         }
         isPaused = false
+        // Finish the backlog before closing up: this is where queued chunks used to vanish.
+        if !pending.isEmpty { status = "transcribing the last \(pending.count) chunk(s)…" }
+        await flushPending()
         closeAudioWriters()
         await applyDiarization()
         status = "done"
@@ -339,12 +348,54 @@ final class MeetingController: ObservableObject {
     private func checkRotation() {
         guard isRunning, !isPaused else { return }
         rotateIfDue(label: "mic", buffered: mic.bufferedSeconds, tail: mic.tailRMS(pauseWindow)) {
-            let chunk = self.mic.drain()
-            Task { await self.ingest(chunk, speaker: "You", stream: .mic) }
+            self.enqueue(self.mic.drain(), speaker: "You", stream: .mic)
         }
         rotateIfDue(label: "others", buffered: system.bufferedSeconds, tail: system.tailRMS(pauseWindow)) {
-            let chunk = self.system.drain()
-            Task { await self.ingest(chunk, speaker: "Others", stream: .system) }
+            self.enqueue(self.system.drain(), speaker: "Others", stream: .system)
+        }
+    }
+
+    // MARK: - Ordered transcription queue
+
+    private struct PendingChunk {
+        let samples: [Float]
+        let speaker: String
+        let stream: Stream
+    }
+
+    /// Rotation used to spawn an unstructured `Task` per chunk onto one serializing
+    /// Transcriber actor. Once a chunk took longer to transcribe than the rotation interval the
+    /// backlog grew for the rest of the meeting, chunks completed out of order, and everything
+    /// still in flight at Stop was dropped — a 38-minute meeting produced 12 lines. One FIFO
+    /// consumer instead: ordered, and drained to completion before the transcript is finished.
+    private func enqueue(_ samples: [Float], speaker: String, stream: Stream) {
+        guard !samples.isEmpty else { return }
+        pending.append(PendingChunk(samples: samples, speaker: speaker, stream: stream))
+        if pending.count > 8 {
+            Log.audio.error("transcription backlog \(self.pending.count) chunks — inference is slower than capture")
+        }
+        kickDrain()
+    }
+
+    private func kickDrain() {
+        guard drainTask == nil else { return }   // a running drain picks up new arrivals itself
+        drainTask = Task { @MainActor in
+            while !pending.isEmpty {
+                let next = pending.removeFirst()
+                await ingest(next.samples, speaker: next.speaker, stream: next.stream)
+            }
+            drainTask = nil
+        }
+    }
+
+    /// Wait until every queued chunk has been transcribed. Called before the transcript is
+    /// finalized so a backlog is finished rather than discarded.
+    private func flushPending() async {
+        kickDrain()
+        while let task = drainTask {
+            await task.value
+            if pending.isEmpty { break }
+            kickDrain()
         }
     }
 
@@ -425,7 +476,7 @@ final class MeetingController: ObservableObject {
         }
         do {
             let language = meetingLanguage == "auto" ? Settings.languageCode : meetingLanguage
-            var raw = try await transcriber.transcribe(samples, language: language)
+            var raw = try await transcriber.transcribe(samples, language: language, preset: .meeting)
             if Settings.outputMode == "roman" { raw = Transliterate.toLatin(raw) }
             raw = TextProcessor.collapseRepeats(raw) // hallucination loops on short call chunks
             // A meeting is a record, not dictated prose: filler removal deletes real words
