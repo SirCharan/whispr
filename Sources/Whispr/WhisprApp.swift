@@ -11,6 +11,7 @@ enum Whispr {
             // with it, leaving CI with an exit code and no idea which check failed.
             setvbuf(stdout, nil, _IONBF, 0)
             WavEncoder.selfTest()
+            ResamplingBuffer.selfTest()
             TextProcessor.selfTest()
             DictionaryStore.selfTest()
             SnippetStore.selfTest()
@@ -89,11 +90,19 @@ enum Whispr {
             return
         }
         RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+        let diag = rec.diagnostics
         let samples = rec.stop()
-        let rms = samples.isEmpty ? 0 : sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count))
+        let rms = ResamplingBuffer.rms(samples)
+        let peak = ResamplingBuffer.maxWindowRMS(samples)
         let wav = WavEncoder.encode(samples)
         try? wav.write(to: URL(fileURLWithPath: path))
-        print("record-test: samples=\(samples.count) (~\(String(format: "%.1f", Double(samples.count) / 16000))s) rms=\(String(format: "%.4f", rms)) wrote=\(path)")
+        print("""
+            record-test: samples=\(samples.count) (~\(String(format: "%.1f", Double(samples.count) / 16000))s) \
+            meanRMS=\(String(format: "%.4f", rms)) peakRMS=\(String(format: "%.4f", peak)) \
+            buffers=\(diag.appends) dropped=\(diag.convertFailures) \
+            format=\(diag.lastFormat ?? "none") wrote=\(path)
+            """)
+        if diag.appends == 0 { print("record-test WARN: no audio buffers ever arrived from the mic") }
     }
 
     /// Capture system audio for N seconds and report sample count + RMS.
@@ -108,9 +117,18 @@ enum Whispr {
                 exit(1)
             }
             try? await Task.sleep(for: .seconds(seconds))
+            let diag = rec.diagnostics
             let samples = await rec.stop()
-            let rms = samples.isEmpty ? 0 : sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count))
-            print("sysaudio-test: samples=\(samples.count) (~\(String(format: "%.1f", Double(samples.count) / 16000))s) rms=\(String(format: "%.4f", rms))")
+            let rms = ResamplingBuffer.rms(samples)
+            let peak = ResamplingBuffer.maxWindowRMS(samples)
+            print("""
+                sysaudio-test: samples=\(samples.count) (~\(String(format: "%.1f", Double(samples.count) / 16000))s) \
+                meanRMS=\(String(format: "%.4f", rms)) peakRMS=\(String(format: "%.4f", peak)) \
+                buffers=\(diag.appends) dropped=\(diag.convertFailures) format=\(diag.lastFormat ?? "none")
+                """)
+            if diag.appends == 0 {
+                print("sysaudio-test WARN: stream started but delivered no audio — check Screen Recording permission")
+            }
             exit(0)
         }
         dispatchMain()

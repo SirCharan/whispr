@@ -32,11 +32,16 @@ final class MeetingController: ObservableObject {
     private let transcriber: Transcriber
     private let diarizer = Diarizer()
     private var timer: Timer?
-    private let minSamples = 8000        // ignore chunks under 0.5 s
+    private let minSamples = 3200        // ignore chunks under 0.2 s
     private let minChunkSeconds = 6.0
     private let maxChunkSeconds = 30.0
     private let pauseWindow = 0.7
     private let pauseRMS: Float = 0.004
+    /// Speech floor applied to the loudest half-second of a chunk (not its mean).
+    private let speechPeakRMS: Float = 0.0035
+
+    /// Meeting cleanup keeps capitalization and spacing but never deletes words.
+    static let meetingTextOptions = TextProcessor.Options(removeFillers: false, cleanUp: true)
 
     // stream timelines (cumulative across pause/resume) + full system audio for stop-time diarization
     private var micOffset = 0.0
@@ -59,7 +64,7 @@ final class MeetingController: ObservableObject {
         if Settings.diarizationEnabled {
             do { try await diarizer.prepare() } // idempotent; first run downloads ~100MB
             catch {
-                NSLog("[Whispr] diarizer prepare failed, falling back to Others: \(error)")
+                Log.audio.error("diarizer prepare failed, falling back to Others: \(error.localizedDescription, privacy: .public)")
                 status = "speaker separation unavailable — using Others"
             }
         }
@@ -163,7 +168,7 @@ final class MeetingController: ObservableObject {
                 }
             }
         } catch {
-            NSLog("[Whispr] diarization failed, keeping Others: \(error)")
+            Log.audio.error("diarization failed, keeping Others: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -190,17 +195,17 @@ final class MeetingController: ObservableObject {
             try exportMarkdown().write(to: url, atomically: true, encoding: .utf8)
             savedTo = url.path
         } catch {
-            NSLog("[Whispr] meeting autosave failed: \(error)")
+            Log.app.error("meeting autosave failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
     private func checkRotation() {
         guard isRunning, !isPaused else { return }
-        rotateIfDue(buffered: mic.bufferedSeconds, tail: mic.tailRMS(pauseWindow)) {
+        rotateIfDue(label: "mic", buffered: mic.bufferedSeconds, tail: mic.tailRMS(pauseWindow)) {
             let chunk = self.mic.drain()
             Task { await self.ingest(chunk, speaker: "You", stream: .mic) }
         }
-        rotateIfDue(buffered: system.bufferedSeconds, tail: system.tailRMS(pauseWindow)) {
+        rotateIfDue(label: "others", buffered: system.bufferedSeconds, tail: system.tailRMS(pauseWindow)) {
             let chunk = self.system.drain()
             Task { await self.ingest(chunk, speaker: "Others", stream: .system) }
         }
@@ -228,9 +233,16 @@ final class MeetingController: ObservableObject {
         print("MeetingController.selfTest PASS")
     }
 
-    private func rotateIfDue(buffered: Double, tail: Float, rotate: () -> Void) {
+    private func rotateIfDue(label: String, buffered: Double, tail: Float, rotate: () -> Void) {
         guard buffered >= minChunkSeconds else { return }
-        if tail < pauseRMS || buffered >= maxChunkSeconds { rotate() }
+        let forced = buffered >= maxChunkSeconds
+        guard tail < pauseRMS || forced else { return }
+        Log.audio.info("""
+            rotate \(label, privacy: .public) buffered=\(buffered, format: .fixed(precision: 1), privacy: .public)s \
+            tailRMS=\(tail, format: .fixed(precision: 4), privacy: .public) \
+            reason=\(forced ? "maxDuration" : "pause", privacy: .public)
+            """)
+        rotate()
     }
 
     // MARK: - Chunk ingestion (timeline-stamped)
@@ -247,25 +259,63 @@ final class MeetingController: ObservableObject {
             start = sysOffset; sysOffset += duration
             fullSysAudio.append(contentsOf: samples) // kept for stop-time diarization
         }
-        guard samples.count >= minSamples else { return }
-        let rms = sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count))
-        guard rms > 0.002 else { return }
+        let which = stream == .mic ? "mic" : "others"
+        let meanRMS = ResamplingBuffer.rms(samples)
+        let peakRMS = ResamplingBuffer.maxWindowRMS(samples)
+        Log.audio.info("""
+            chunk \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s \
+            dur=\(duration, format: .fixed(precision: 1), privacy: .public)s \
+            meanRMS=\(meanRMS, format: .fixed(precision: 4), privacy: .public) \
+            peakRMS=\(peakRMS, format: .fixed(precision: 4), privacy: .public)
+            """)
+        guard samples.count >= minSamples else {
+            Log.audio.info("drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — too short (\(samples.count) samples)")
+            return
+        }
+        // Gate on the LOUDEST half-second, not the chunk mean. The old `mean > 0.002` test
+        // discarded any chunk where real speech was diluted by surrounding silence — the
+        // mechanism behind the multi-minute blank gaps. Both levels are logged so the
+        // threshold can be set from real meeting data rather than guessed.
+        guard peakRMS > speechPeakRMS else {
+            Log.audio.info("""
+                drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — \
+                below speech floor (peak \(peakRMS, format: .fixed(precision: 4), privacy: .public) \
+                <= \(self.speechPeakRMS, format: .fixed(precision: 4), privacy: .public))
+                """)
+            return
+        }
         do {
             let language = meetingLanguage == "auto" ? Settings.languageCode : meetingLanguage
             var raw = try await transcriber.transcribe(samples, language: language)
             if Settings.outputMode == "roman" { raw = Transliterate.toLatin(raw) }
             raw = TextProcessor.collapseRepeats(raw) // hallucination loops on short call chunks
-            let text = TextProcessor.process(raw, options: Settings.textOptions)
-            guard !text.isEmpty else { return }
+            // A meeting is a record, not dictated prose: filler removal deletes real words
+            // (and mangles Hindi tokens). Keep only the non-destructive cleanup.
+            let text = TextProcessor.process(raw, options: Self.meetingTextOptions)
+            guard !text.isEmpty else {
+                Log.audio.info("drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — empty after cleanup (raw was \(raw.count) chars)")
+                return
+            }
             let line = MeetingLine(speaker: speaker, text: text, start: start, end: start + duration)
-            // echo dedup: same words on both streams = speaker bleed; keep the digital (system) copy
-            if stream == .mic, lines.contains(where: { $0.speaker != "You" && Self.isEchoPair($0, line) }) { return }
-            if stream == .system { lines.removeAll { $0.speaker == "You" && Self.isEchoPair($0, line) } }
+            // Echo dedup is DISABLED. It deleted a "You" line whenever a system line read the
+            // same — and on speakers-plus-built-in-mic the mic hears every remote voice, so it
+            // erased the entire mic stream (zero "You" lines in every meeting since 27 Jul).
+            // Deleting a real line is unrecoverable; a duplicate is merely untidy. Still logged,
+            // because a hit here means the mic is picking up room playback (an AEC problem).
+            if let twin = lines.first(where: { $0.speaker != speaker && Self.isEchoPair($0, line) }) {
+                Log.audio.info("""
+                    echo overlap kept (was deleted before): \(which, privacy: .public) \
+                    "\(text, privacy: .public)" vs \(twin.speaker, privacy: .public) "\(twin.text, privacy: .public)"
+                    """)
+            }
             lines.append(line)
             lines.sort { $0.start < $1.start } // interleave You/Others in spoken order
             autosave() // live checkpoint
         } catch {
-            NSLog("[Whispr] meeting chunk failed (\(speaker)): \(error)")
+            Log.audio.error("""
+                meeting chunk failed (\(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s): \
+                \(error.localizedDescription, privacy: .public)
+                """)
         }
     }
 

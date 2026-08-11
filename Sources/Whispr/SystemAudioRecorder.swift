@@ -10,6 +10,14 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private let buffer = ResamplingBuffer()
     private(set) var isRecording = false
+
+    override init() {
+        super.init()
+        buffer.label = "others"
+    }
+
+    /// Buffer-arrival counters, for the CLI gates and for diagnosing a dead stream.
+    var diagnostics: ResamplingBuffer.Diagnostics { buffer.diagnostics }
     /// Fired if the OS tears the stream down mid-meeting (permission revoked, display change).
     /// Lets MeetingController surface it instead of silently freezing "Others".
     var onUnexpectedStop: (@Sendable () -> Void)?
@@ -58,8 +66,12 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        NSLog("[Whispr] system-audio stream stopped: \(error)")
         let wasRecording = isRecording
+        Log.audio.error("""
+            others: SCStream stopped mid-capture=\(wasRecording, privacy: .public) \
+            error=\(error.localizedDescription, privacy: .public) \
+            buffersReceived=\(self.buffer.diagnostics.appends, privacy: .public)
+            """)
         isRecording = false
         if wasRecording { onUnexpectedStop?() } // only if it died mid-capture, not on normal stop()
     }
@@ -67,13 +79,23 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private static func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc),
-              let format = AVAudioFormat(streamDescription: asbd) else { return nil }
+              let format = AVAudioFormat(streamDescription: asbd) else {
+            Log.audio.error("others: sample buffer has no usable format description")
+            return nil
+        }
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+            Log.audio.error("others: PCM buffer alloc failed for \(frames) frames")
+            return nil
+        }
         buf.frameLength = frames
         let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
             sampleBuffer, at: 0, frameCount: Int32(frames), into: buf.mutableAudioBufferList
         )
-        return status == noErr ? buf : nil
+        if status != noErr {
+            Log.audio.error("others: CMSampleBufferCopyPCMData failed status=\(status, privacy: .public)")
+            return nil
+        }
+        return buf
     }
 }
