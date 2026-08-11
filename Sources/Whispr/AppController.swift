@@ -264,7 +264,7 @@ final class AppController {
             startPreviewLoop()
         } catch {
             setStatus("mic error")
-            NSLog("[Whispr] mic start failed: \(error)")
+            Log.audio.error("mic start failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 

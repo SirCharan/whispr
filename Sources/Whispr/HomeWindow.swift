@@ -404,6 +404,11 @@ private struct ModelsPane: View {
                 }
                 Text("Switching downloads the model if needed, then reloads. Turbo = best accuracy; tiny/base = fastest.")
                     .font(.caption).foregroundStyle(.secondary)
+                if let tip = ModelManager.recommendation(language: language, selected: model) {
+                    Label(tip, systemImage: "lightbulb")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
             Section("Language") {
                 Picker("Spoken language", selection: $language) {
