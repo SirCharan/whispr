@@ -23,12 +23,30 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     var onUnexpectedStop: (@Sendable () -> Void)?
 
     func start() async throws {
+        buffer.reset()
+        try await begin()
+    }
+
+    /// Re-open the stream after the OS tore it down, KEEPING whatever is already buffered.
+    /// A display change or a sleep/wake used to end the "Others" side of a meeting permanently.
+    func restart() async throws {
+        try? await stream?.stopCapture()
+        stream = nil
+        try await begin()
+    }
+
+    private func begin() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else { throw SystemAudioError.noDisplay }
 
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
+        // Ask explicitly instead of inheriting defaults. queueDepth defaulted to 3, which drops
+        // audio buffers whenever the handler queue falls behind — invisible sample loss.
+        config.sampleRate = 48000
+        config.channelCount = 2
+        config.queueDepth = 8
         // minimal video so the stream runs; frames are ignored
         config.width = 2
         config.height = 2
@@ -39,8 +57,8 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "whispr.sysaudio"))
         try await stream.startCapture()
         self.stream = stream
-        buffer.reset()
         isRecording = true
+        Log.audio.info("others: SCStream started (48000Hz 2ch, queueDepth 8)")
     }
 
     /// Stop and return all captured 16 kHz mono samples.

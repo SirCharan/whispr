@@ -27,6 +27,13 @@ enum Settings {
         set { UserDefaults.standard.set(newValue, forKey: "diarizationEnabled") }
     }
 
+    /// Days to keep the raw meeting audio (16 kHz mono WAV, ~115 MB/hour/stream) so a bad
+    /// transcript can be re-run offline. 0 disables retention entirely.
+    static var meetingAudioRetentionDays: Int {
+        get { UserDefaults.standard.object(forKey: "meetingAudioRetentionDays") as? Int ?? 7 }
+        set { UserDefaults.standard.set(newValue, forKey: "meetingAudioRetentionDays") }
+    }
+
     /// Show the small persistent floating mic pill (click to dictate).
     static var showIdleWidget: Bool {
         get { UserDefaults.standard.object(forKey: "showIdleWidget") as? Bool ?? true }

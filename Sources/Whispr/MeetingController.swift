@@ -24,6 +24,9 @@ final class MeetingController: ObservableObject {
     @Published private(set) var needsScreenRec = false
     @Published private(set) var savedTo: String?
     @Published var showRenameSheet = false
+    /// Per-stream capture health, shown in MeetingView so a dead stream never reads as a quiet room.
+    @Published private(set) var micHealthy = true
+    @Published private(set) var systemHealthy = true
     /// Per-meeting language override ("auto" = follow the global setting). Read per chunk, editable live.
     @Published var meetingLanguage = "auto"
 
@@ -50,6 +53,20 @@ final class MeetingController: ObservableObject {
     // ponytail: full floats in RAM ≈ 230MB/hour — fine for normal meetings; stream-to-disk if ever needed
     private var meetingFile: URL?
 
+    // raw-audio retention
+    private var micWav: WavEncoder.Writer?
+    private var sysWav: WavEncoder.Writer?
+
+    // liveness tracking (buffer arrival, not energy)
+    private let stallTicks = 5            // seconds of no buffers before a stream is called dead
+    private let maxSysRestarts = 8
+    private var lastMicAppends = 0
+    private var lastSysAppends = 0
+    private var micQuietTicks = 0
+    private var sysQuietTicks = 0
+    private var sysRestartAttempts = 0
+    private var sysRestartCooldown = 0
+
     init(transcriber: Transcriber) {
         self.transcriber = transcriber
     }
@@ -68,6 +85,16 @@ final class MeetingController: ObservableObject {
                 status = "speaker separation unavailable — using Others"
             }
         }
+        // Assigned BEFORE start: a teardown during startup used to land in the gap between
+        // system.start() and this line, and was lost.
+        system.onUnexpectedStop = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isRunning, !self.isPaused else { return }
+                self.systemHealthy = false
+                self.status = "the other side's audio dropped — reconnecting…"
+                await self.restartSystemAudio()
+            }
+        }
         do {
             try mic.start(voiceProcessing: true) // AEC: keep speaker playback out of "You"
             try await system.start()
@@ -76,12 +103,6 @@ final class MeetingController: ObservableObject {
             status = needsScreenRec ? "needs Screen Recording permission" : "start failed: \(error.localizedDescription)"
             _ = mic.stop()
             return
-        }
-        system.onUnexpectedStop = { [weak self] in
-            Task { @MainActor in
-                guard let self, self.isRunning, !self.isPaused else { return }
-                self.status = "the other side's audio stopped (permission or display change) — press Stop, then start again to continue"
-            }
         }
         isRunning = true
         isPaused = false
@@ -99,8 +120,117 @@ final class MeetingController: ObservableObject {
         let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false))
             .replacingOccurrences(of: ":", with: "-")
         meetingFile = dir.appendingPathComponent("meeting-\(stamp).md")
+        openAudioWriters(dir: dir, stamp: stamp)
+        micHealthy = true
+        systemHealthy = true
+        lastMicAppends = 0; lastSysAppends = 0
+        micQuietTicks = 0; sysQuietTicks = 0
+        sysRestartAttempts = 0; sysRestartCooldown = 0
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkRotation() }
+            Task { @MainActor in
+                self?.checkHealth()
+                self?.checkRotation()
+            }
+        }
+    }
+
+    // MARK: - Raw audio retention
+
+    /// Keep the raw 16 kHz mono audio so a bad transcript can be re-run offline with
+    /// `--transcribe-file` instead of being lost. 115 MB/hour/stream.
+    private func openAudioWriters(dir: URL, stamp: String) {
+        guard Settings.meetingAudioRetentionDays > 0 else { return }
+        let audioDir = dir.appendingPathComponent("audio", isDirectory: true)
+        try? FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+        pruneOldAudio(in: audioDir)
+        do {
+            micWav = try WavEncoder.Writer(url: audioDir.appendingPathComponent("meeting-\(stamp)-you.wav"))
+            sysWav = try WavEncoder.Writer(url: audioDir.appendingPathComponent("meeting-\(stamp)-others.wav"))
+            Log.app.info("meeting audio retention on → \(audioDir.path, privacy: .public)")
+        } catch {
+            Log.app.error("could not open meeting audio writers: \(error.localizedDescription, privacy: .public)")
+            micWav = nil; sysWav = nil
+        }
+    }
+
+    private func pruneOldAudio(in dir: URL) {
+        let days = Settings.meetingAudioRetentionDays
+        guard days > 0 else { return }
+        let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        for f in files where f.pathExtension == "wav" {
+            let modified = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, modified < cutoff {
+                try? fm.removeItem(at: f)
+                Log.app.info("pruned old meeting audio \(f.lastPathComponent, privacy: .public)")
+            }
+        }
+    }
+
+    private func closeAudioWriters() {
+        micWav?.close(); sysWav?.close()
+        micWav = nil; sysWav = nil
+    }
+
+    // MARK: - Stream liveness
+
+    /// A stream that starts and then delivers nothing used to be indistinguishable from a
+    /// silent room. Watch buffer ARRIVAL (not energy) and say so out loud.
+    private func checkHealth() {
+        guard isRunning, !isPaused else { return }
+
+        let micAppends = mic.diagnostics.appends
+        if micAppends == lastMicAppends {
+            micQuietTicks += 1
+            if micQuietTicks == stallTicks {
+                micHealthy = false
+                Log.audio.error("mic: no buffers for \(self.stallTicks)s — input device stalled")
+                status = "your microphone stopped delivering audio"
+            }
+        } else {
+            if !micHealthy { Log.audio.info("mic: buffers resumed") }
+            micQuietTicks = 0; micHealthy = true
+        }
+        lastMicAppends = micAppends
+
+        if sysRestartCooldown > 0 { sysRestartCooldown -= 1 }
+        let sysAppends = system.diagnostics.appends
+        if sysAppends == lastSysAppends {
+            sysQuietTicks += 1
+            if sysQuietTicks == stallTicks {
+                systemHealthy = false
+                Log.audio.error("others: no buffers for \(self.stallTicks)s — stream stalled")
+                Task { await self.restartSystemAudio() }
+            }
+        } else {
+            if !systemHealthy {
+                Log.audio.info("others: buffers resumed")
+                status = "recording"
+            }
+            sysQuietTicks = 0; systemHealthy = true; sysRestartAttempts = 0
+        }
+        lastSysAppends = sysAppends
+    }
+
+    /// Reconnect the system-audio tap with exponential backoff, keeping buffered audio.
+    private func restartSystemAudio() async {
+        guard isRunning, !isPaused, sysRestartCooldown == 0 else { return }
+        guard sysRestartAttempts < maxSysRestarts else {
+            status = "the other side's audio is unavailable — this transcript will be mic-only"
+            return
+        }
+        sysRestartAttempts += 1
+        let backoff = min(30, Int(pow(2.0, Double(sysRestartAttempts - 1))))
+        sysRestartCooldown = backoff
+        sysQuietTicks = 0
+        Log.audio.info("others: restart attempt \(self.sysRestartAttempts)/\(self.maxSysRestarts), next retry in \(backoff)s")
+        do {
+            try await system.restart()
+            status = "recording"
+        } catch {
+            Log.audio.error("others: restart failed: \(error.localizedDescription, privacy: .public)")
+            status = "reconnecting the other side's audio…"
         }
     }
 
@@ -128,8 +258,14 @@ final class MeetingController: ObservableObject {
         }
         isPaused = false
         status = "recording"
+        lastMicAppends = mic.diagnostics.appends
+        lastSysAppends = system.diagnostics.appends
+        micQuietTicks = 0; sysQuietTicks = 0
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkRotation() }
+            Task { @MainActor in
+                self?.checkHealth()
+                self?.checkRotation()
+            }
         }
     }
 
@@ -145,6 +281,7 @@ final class MeetingController: ObservableObject {
             await ingest(sysTail, speaker: "Others", stream: .system)
         }
         isPaused = false
+        closeAudioWriters()
         await applyDiarization()
         status = "done"
         if !lines.isEmpty {
@@ -255,9 +392,11 @@ final class MeetingController: ObservableObject {
         switch stream {
         case .mic:
             start = micOffset; micOffset += duration
+            micWav?.append(samples)
         case .system:
             start = sysOffset; sysOffset += duration
             fullSysAudio.append(contentsOf: samples) // kept for stop-time diarization
+            sysWav?.append(samples)
         }
         let which = stream == .mic ? "mic" : "others"
         let meanRMS = ResamplingBuffer.rms(samples)
