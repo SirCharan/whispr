@@ -12,6 +12,8 @@ struct SettingsView: View {
     @AppStorage("removeFillers") private var removeFillers = true
     @AppStorage("cleanUp") private var cleanUp = true
     @AppStorage("soundCues") private var soundCues = true
+    @AppStorage("muteWhileDictating") private var muteWhileDictating = true
+    @AppStorage("muteMode") private var muteMode = "mute"
     @AppStorage("showIdleWidget") private var showIdleWidget = true
     @AppStorage("diarizationEnabled") private var diarizationEnabled = true
     @AppStorage("hotkeyMode") private var hotkeyMode = "fn"
@@ -42,6 +44,18 @@ struct SettingsView: View {
             Section("Behavior") {
                 Toggle("Auto-paste at cursor (off = copy to clipboard only)", isOn: $autoPaste)
                 Toggle("Sound cues on record start/stop", isOn: $soundCues)
+                Toggle("Silence other audio while dictating", isOn: $muteWhileDictating)
+                if muteWhileDictating {
+                    Picker("While dictating", selection: $muteMode) {
+                        Text("Mute the output").tag("mute")
+                        Text("Pause what's playing").tag("pause")
+                    }
+                    .pickerStyle(.radioGroup)
+                    Text(muteMode == "pause"
+                         ? "Sends the play/pause key, so you keep your place. It can't read what's playing, so it may occasionally toggle the wrong way."
+                         : "Mutes your output device and unmutes it when dictation ends. Only acts if audio is already playing; if you muted it yourself it stays muted.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Toggle("Separate remote meeting speakers (A/B) by voice", isOn: $diarizationEnabled)
                 Toggle("Floating mic button (click to dictate)", isOn: $showIdleWidget)
                     .onChange(of: showIdleWidget) { _, _ in NotificationCenter.default.post(name: .whisprHotkeyModeChanged, object: nil) }

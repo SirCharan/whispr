@@ -27,6 +27,27 @@ enum Settings {
         set { UserDefaults.standard.set(newValue, forKey: "diarizationEnabled") }
     }
 
+    /// Silence other audio while dictating, then put it back. Dictation only — meetings never
+    /// touch the output, because the remote party's audio IS the system output we capture.
+    static var muteWhileDictating: Bool {
+        get { UserDefaults.standard.object(forKey: "muteWhileDictating") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "muteWhileDictating") }
+    }
+
+    /// How to silence: "mute" the output device (default, deterministic) or "pause" whatever is
+    /// playing via the play/pause media key (keeps your place, but it is a blind toggle).
+    static var muteMode: String {
+        get { UserDefaults.standard.string(forKey: "muteMode") ?? "mute" }
+        set { UserDefaults.standard.set(newValue, forKey: "muteMode") }
+    }
+
+    /// Days to keep the raw meeting audio (16 kHz mono WAV, ~115 MB/hour/stream) so a bad
+    /// transcript can be re-run offline. 0 disables retention entirely.
+    static var meetingAudioRetentionDays: Int {
+        get { UserDefaults.standard.object(forKey: "meetingAudioRetentionDays") as? Int ?? 7 }
+        set { UserDefaults.standard.set(newValue, forKey: "meetingAudioRetentionDays") }
+    }
+
     /// Show the small persistent floating mic pill (click to dictate).
     static var showIdleWidget: Bool {
         get { UserDefaults.standard.object(forKey: "showIdleWidget") as? Bool ?? true }

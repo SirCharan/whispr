@@ -24,6 +24,9 @@ final class MeetingController: ObservableObject {
     @Published private(set) var needsScreenRec = false
     @Published private(set) var savedTo: String?
     @Published var showRenameSheet = false
+    /// Per-stream capture health, shown in MeetingView so a dead stream never reads as a quiet room.
+    @Published private(set) var micHealthy = true
+    @Published private(set) var systemHealthy = true
     /// Per-meeting language override ("auto" = follow the global setting). Read per chunk, editable live.
     @Published var meetingLanguage = "auto"
 
@@ -32,11 +35,16 @@ final class MeetingController: ObservableObject {
     private let transcriber: Transcriber
     private let diarizer = Diarizer()
     private var timer: Timer?
-    private let minSamples = 8000        // ignore chunks under 0.5 s
+    private let minSamples = 3200        // ignore chunks under 0.2 s
     private let minChunkSeconds = 6.0
     private let maxChunkSeconds = 30.0
     private let pauseWindow = 0.7
     private let pauseRMS: Float = 0.004
+    /// Speech floor applied to the loudest half-second of a chunk (not its mean).
+    private let speechPeakRMS: Float = 0.0035
+
+    /// Meeting cleanup keeps capitalization and spacing but never deletes words.
+    static let meetingTextOptions = TextProcessor.Options(removeFillers: false, cleanUp: true)
 
     // stream timelines (cumulative across pause/resume) + full system audio for stop-time diarization
     private var micOffset = 0.0
@@ -44,6 +52,24 @@ final class MeetingController: ObservableObject {
     private var fullSysAudio: [Float] = []
     // ponytail: full floats in RAM ≈ 230MB/hour — fine for normal meetings; stream-to-disk if ever needed
     private var meetingFile: URL?
+
+    // raw-audio retention
+    private var micWav: WavEncoder.Writer?
+    private var sysWav: WavEncoder.Writer?
+
+    // liveness tracking (buffer arrival, not energy)
+    private let stallTicks = 5            // seconds of no buffers before a stream is called dead
+    private let maxSysRestarts = 8
+    private var lastMicAppends = 0
+    private var lastSysAppends = 0
+    private var micQuietTicks = 0
+    private var sysQuietTicks = 0
+    private var sysRestartAttempts = 0
+    private var sysRestartCooldown = 0
+
+    // ordered transcription queue
+    private var pending: [PendingChunk] = []
+    private var drainTask: Task<Void, Never>?
 
     init(transcriber: Transcriber) {
         self.transcriber = transcriber
@@ -59,8 +85,18 @@ final class MeetingController: ObservableObject {
         if Settings.diarizationEnabled {
             do { try await diarizer.prepare() } // idempotent; first run downloads ~100MB
             catch {
-                NSLog("[Whispr] diarizer prepare failed, falling back to Others: \(error)")
+                Log.audio.error("diarizer prepare failed, falling back to Others: \(error.localizedDescription, privacy: .public)")
                 status = "speaker separation unavailable — using Others"
+            }
+        }
+        // Assigned BEFORE start: a teardown during startup used to land in the gap between
+        // system.start() and this line, and was lost.
+        system.onUnexpectedStop = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isRunning, !self.isPaused else { return }
+                self.systemHealthy = false
+                self.status = "the other side's audio dropped — reconnecting…"
+                await self.restartSystemAudio()
             }
         }
         do {
@@ -72,12 +108,6 @@ final class MeetingController: ObservableObject {
             _ = mic.stop()
             return
         }
-        system.onUnexpectedStop = { [weak self] in
-            Task { @MainActor in
-                guard let self, self.isRunning, !self.isPaused else { return }
-                self.status = "the other side's audio stopped (permission or display change) — press Stop, then start again to continue"
-            }
-        }
         isRunning = true
         isPaused = false
         needsScreenRec = false
@@ -87,6 +117,7 @@ final class MeetingController: ObservableObject {
         lines.removeAll()
         micOffset = 0; sysOffset = 0
         fullSysAudio.removeAll()
+        pending.removeAll()
         // fix the checkpoint file at start so every save hits the same path
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("OpenWispr", isDirectory: true)
@@ -94,8 +125,117 @@ final class MeetingController: ObservableObject {
         let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false))
             .replacingOccurrences(of: ":", with: "-")
         meetingFile = dir.appendingPathComponent("meeting-\(stamp).md")
+        openAudioWriters(dir: dir, stamp: stamp)
+        micHealthy = true
+        systemHealthy = true
+        lastMicAppends = 0; lastSysAppends = 0
+        micQuietTicks = 0; sysQuietTicks = 0
+        sysRestartAttempts = 0; sysRestartCooldown = 0
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkRotation() }
+            Task { @MainActor in
+                self?.checkHealth()
+                self?.checkRotation()
+            }
+        }
+    }
+
+    // MARK: - Raw audio retention
+
+    /// Keep the raw 16 kHz mono audio so a bad transcript can be re-run offline with
+    /// `--transcribe-file` instead of being lost. 115 MB/hour/stream.
+    private func openAudioWriters(dir: URL, stamp: String) {
+        guard Settings.meetingAudioRetentionDays > 0 else { return }
+        let audioDir = dir.appendingPathComponent("audio", isDirectory: true)
+        try? FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+        pruneOldAudio(in: audioDir)
+        do {
+            micWav = try WavEncoder.Writer(url: audioDir.appendingPathComponent("meeting-\(stamp)-you.wav"))
+            sysWav = try WavEncoder.Writer(url: audioDir.appendingPathComponent("meeting-\(stamp)-others.wav"))
+            Log.app.info("meeting audio retention on → \(audioDir.path, privacy: .public)")
+        } catch {
+            Log.app.error("could not open meeting audio writers: \(error.localizedDescription, privacy: .public)")
+            micWav = nil; sysWav = nil
+        }
+    }
+
+    private func pruneOldAudio(in dir: URL) {
+        let days = Settings.meetingAudioRetentionDays
+        guard days > 0 else { return }
+        let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        for f in files where f.pathExtension == "wav" {
+            let modified = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, modified < cutoff {
+                try? fm.removeItem(at: f)
+                Log.app.info("pruned old meeting audio \(f.lastPathComponent, privacy: .public)")
+            }
+        }
+    }
+
+    private func closeAudioWriters() {
+        micWav?.close(); sysWav?.close()
+        micWav = nil; sysWav = nil
+    }
+
+    // MARK: - Stream liveness
+
+    /// A stream that starts and then delivers nothing used to be indistinguishable from a
+    /// silent room. Watch buffer ARRIVAL (not energy) and say so out loud.
+    private func checkHealth() {
+        guard isRunning, !isPaused else { return }
+
+        let micAppends = mic.diagnostics.appends
+        if micAppends == lastMicAppends {
+            micQuietTicks += 1
+            if micQuietTicks == stallTicks {
+                micHealthy = false
+                Log.audio.error("mic: no buffers for \(self.stallTicks)s — input device stalled")
+                status = "your microphone stopped delivering audio"
+            }
+        } else {
+            if !micHealthy { Log.audio.info("mic: buffers resumed") }
+            micQuietTicks = 0; micHealthy = true
+        }
+        lastMicAppends = micAppends
+
+        if sysRestartCooldown > 0 { sysRestartCooldown -= 1 }
+        let sysAppends = system.diagnostics.appends
+        if sysAppends == lastSysAppends {
+            sysQuietTicks += 1
+            if sysQuietTicks == stallTicks {
+                systemHealthy = false
+                Log.audio.error("others: no buffers for \(self.stallTicks)s — stream stalled")
+                Task { await self.restartSystemAudio() }
+            }
+        } else {
+            if !systemHealthy {
+                Log.audio.info("others: buffers resumed")
+                status = "recording"
+            }
+            sysQuietTicks = 0; systemHealthy = true; sysRestartAttempts = 0
+        }
+        lastSysAppends = sysAppends
+    }
+
+    /// Reconnect the system-audio tap with exponential backoff, keeping buffered audio.
+    private func restartSystemAudio() async {
+        guard isRunning, !isPaused, sysRestartCooldown == 0 else { return }
+        guard sysRestartAttempts < maxSysRestarts else {
+            status = "the other side's audio is unavailable — this transcript will be mic-only"
+            return
+        }
+        sysRestartAttempts += 1
+        let backoff = min(30, Int(pow(2.0, Double(sysRestartAttempts - 1))))
+        sysRestartCooldown = backoff
+        sysQuietTicks = 0
+        Log.audio.info("others: restart attempt \(self.sysRestartAttempts)/\(self.maxSysRestarts), next retry in \(backoff)s")
+        do {
+            try await system.restart()
+            status = "recording"
+        } catch {
+            Log.audio.error("others: restart failed: \(error.localizedDescription, privacy: .public)")
+            status = "reconnecting the other side's audio…"
         }
     }
 
@@ -107,8 +247,9 @@ final class MeetingController: ObservableObject {
         status = "pausing…"
         let micTail = mic.stop()
         let sysTail = await system.stop()
-        await ingest(micTail, speaker: "You", stream: .mic)
-        await ingest(sysTail, speaker: "Others", stream: .system)
+        enqueue(micTail, speaker: "You", stream: .mic)
+        enqueue(sysTail, speaker: "Others", stream: .system)
+        await flushPending()
         status = "paused"
     }
 
@@ -123,8 +264,14 @@ final class MeetingController: ObservableObject {
         }
         isPaused = false
         status = "recording"
+        lastMicAppends = mic.diagnostics.appends
+        lastSysAppends = system.diagnostics.appends
+        micQuietTicks = 0; sysQuietTicks = 0
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkRotation() }
+            Task { @MainActor in
+                self?.checkHealth()
+                self?.checkRotation()
+            }
         }
     }
 
@@ -136,10 +283,14 @@ final class MeetingController: ObservableObject {
         if !isPaused {
             let micTail = mic.stop()
             let sysTail = await system.stop()
-            await ingest(micTail, speaker: "You", stream: .mic)
-            await ingest(sysTail, speaker: "Others", stream: .system)
+            enqueue(micTail, speaker: "You", stream: .mic)
+            enqueue(sysTail, speaker: "Others", stream: .system)
         }
         isPaused = false
+        // Finish the backlog before closing up: this is where queued chunks used to vanish.
+        if !pending.isEmpty { status = "transcribing the last \(pending.count) chunk(s)…" }
+        await flushPending()
+        closeAudioWriters()
         await applyDiarization()
         status = "done"
         if !lines.isEmpty {
@@ -163,7 +314,7 @@ final class MeetingController: ObservableObject {
                 }
             }
         } catch {
-            NSLog("[Whispr] diarization failed, keeping Others: \(error)")
+            Log.audio.error("diarization failed, keeping Others: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -190,19 +341,61 @@ final class MeetingController: ObservableObject {
             try exportMarkdown().write(to: url, atomically: true, encoding: .utf8)
             savedTo = url.path
         } catch {
-            NSLog("[Whispr] meeting autosave failed: \(error)")
+            Log.app.error("meeting autosave failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
     private func checkRotation() {
         guard isRunning, !isPaused else { return }
-        rotateIfDue(buffered: mic.bufferedSeconds, tail: mic.tailRMS(pauseWindow)) {
-            let chunk = self.mic.drain()
-            Task { await self.ingest(chunk, speaker: "You", stream: .mic) }
+        rotateIfDue(label: "mic", buffered: mic.bufferedSeconds, tail: mic.tailRMS(pauseWindow)) {
+            self.enqueue(self.mic.drain(), speaker: "You", stream: .mic)
         }
-        rotateIfDue(buffered: system.bufferedSeconds, tail: system.tailRMS(pauseWindow)) {
-            let chunk = self.system.drain()
-            Task { await self.ingest(chunk, speaker: "Others", stream: .system) }
+        rotateIfDue(label: "others", buffered: system.bufferedSeconds, tail: system.tailRMS(pauseWindow)) {
+            self.enqueue(self.system.drain(), speaker: "Others", stream: .system)
+        }
+    }
+
+    // MARK: - Ordered transcription queue
+
+    private struct PendingChunk {
+        let samples: [Float]
+        let speaker: String
+        let stream: Stream
+    }
+
+    /// Rotation used to spawn an unstructured `Task` per chunk onto one serializing
+    /// Transcriber actor. Once a chunk took longer to transcribe than the rotation interval the
+    /// backlog grew for the rest of the meeting, chunks completed out of order, and everything
+    /// still in flight at Stop was dropped — a 38-minute meeting produced 12 lines. One FIFO
+    /// consumer instead: ordered, and drained to completion before the transcript is finished.
+    private func enqueue(_ samples: [Float], speaker: String, stream: Stream) {
+        guard !samples.isEmpty else { return }
+        pending.append(PendingChunk(samples: samples, speaker: speaker, stream: stream))
+        if pending.count > 8 {
+            Log.audio.error("transcription backlog \(self.pending.count) chunks — inference is slower than capture")
+        }
+        kickDrain()
+    }
+
+    private func kickDrain() {
+        guard drainTask == nil else { return }   // a running drain picks up new arrivals itself
+        drainTask = Task { @MainActor in
+            while !pending.isEmpty {
+                let next = pending.removeFirst()
+                await ingest(next.samples, speaker: next.speaker, stream: next.stream)
+            }
+            drainTask = nil
+        }
+    }
+
+    /// Wait until every queued chunk has been transcribed. Called before the transcript is
+    /// finalized so a backlog is finished rather than discarded.
+    private func flushPending() async {
+        kickDrain()
+        while let task = drainTask {
+            await task.value
+            if pending.isEmpty { break }
+            kickDrain()
         }
     }
 
@@ -228,9 +421,16 @@ final class MeetingController: ObservableObject {
         print("MeetingController.selfTest PASS")
     }
 
-    private func rotateIfDue(buffered: Double, tail: Float, rotate: () -> Void) {
+    private func rotateIfDue(label: String, buffered: Double, tail: Float, rotate: () -> Void) {
         guard buffered >= minChunkSeconds else { return }
-        if tail < pauseRMS || buffered >= maxChunkSeconds { rotate() }
+        let forced = buffered >= maxChunkSeconds
+        guard tail < pauseRMS || forced else { return }
+        Log.audio.info("""
+            rotate \(label, privacy: .public) buffered=\(buffered, format: .fixed(precision: 1), privacy: .public)s \
+            tailRMS=\(tail, format: .fixed(precision: 4), privacy: .public) \
+            reason=\(forced ? "maxDuration" : "pause", privacy: .public)
+            """)
+        rotate()
     }
 
     // MARK: - Chunk ingestion (timeline-stamped)
@@ -243,29 +443,69 @@ final class MeetingController: ObservableObject {
         switch stream {
         case .mic:
             start = micOffset; micOffset += duration
+            micWav?.append(samples)
         case .system:
             start = sysOffset; sysOffset += duration
             fullSysAudio.append(contentsOf: samples) // kept for stop-time diarization
+            sysWav?.append(samples)
         }
-        guard samples.count >= minSamples else { return }
-        let rms = sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count))
-        guard rms > 0.002 else { return }
+        let which = stream == .mic ? "mic" : "others"
+        let meanRMS = ResamplingBuffer.rms(samples)
+        let peakRMS = ResamplingBuffer.maxWindowRMS(samples)
+        Log.audio.info("""
+            chunk \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s \
+            dur=\(duration, format: .fixed(precision: 1), privacy: .public)s \
+            meanRMS=\(meanRMS, format: .fixed(precision: 4), privacy: .public) \
+            peakRMS=\(peakRMS, format: .fixed(precision: 4), privacy: .public)
+            """)
+        guard samples.count >= minSamples else {
+            Log.audio.info("drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — too short (\(samples.count) samples)")
+            return
+        }
+        // Gate on the LOUDEST half-second, not the chunk mean. The old `mean > 0.002` test
+        // discarded any chunk where real speech was diluted by surrounding silence — the
+        // mechanism behind the multi-minute blank gaps. Both levels are logged so the
+        // threshold can be set from real meeting data rather than guessed.
+        guard peakRMS > speechPeakRMS else {
+            Log.audio.info("""
+                drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — \
+                below speech floor (peak \(peakRMS, format: .fixed(precision: 4), privacy: .public) \
+                <= \(self.speechPeakRMS, format: .fixed(precision: 4), privacy: .public))
+                """)
+            return
+        }
         do {
             let language = meetingLanguage == "auto" ? Settings.languageCode : meetingLanguage
-            var raw = try await transcriber.transcribe(samples, language: language)
+            var raw = try await transcriber.transcribe(samples, language: language, preset: .meeting)
             if Settings.outputMode == "roman" { raw = Transliterate.toLatin(raw) }
             raw = TextProcessor.collapseRepeats(raw) // hallucination loops on short call chunks
-            let text = TextProcessor.process(raw, options: Settings.textOptions)
-            guard !text.isEmpty else { return }
+            // A meeting is a record, not dictated prose: filler removal deletes real words
+            // (and mangles Hindi tokens). Keep only the non-destructive cleanup.
+            let text = TextProcessor.process(raw, options: Self.meetingTextOptions)
+            guard !text.isEmpty else {
+                Log.audio.info("drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — empty after cleanup (raw was \(raw.count) chars)")
+                return
+            }
             let line = MeetingLine(speaker: speaker, text: text, start: start, end: start + duration)
-            // echo dedup: same words on both streams = speaker bleed; keep the digital (system) copy
-            if stream == .mic, lines.contains(where: { $0.speaker != "You" && Self.isEchoPair($0, line) }) { return }
-            if stream == .system { lines.removeAll { $0.speaker == "You" && Self.isEchoPair($0, line) } }
+            // Echo dedup is DISABLED. It deleted a "You" line whenever a system line read the
+            // same — and on speakers-plus-built-in-mic the mic hears every remote voice, so it
+            // erased the entire mic stream (zero "You" lines in every meeting since 27 Jul).
+            // Deleting a real line is unrecoverable; a duplicate is merely untidy. Still logged,
+            // because a hit here means the mic is picking up room playback (an AEC problem).
+            if let twin = lines.first(where: { $0.speaker != speaker && Self.isEchoPair($0, line) }) {
+                Log.audio.info("""
+                    echo overlap kept (was deleted before): \(which, privacy: .public) \
+                    "\(text, privacy: .public)" vs \(twin.speaker, privacy: .public) "\(twin.text, privacy: .public)"
+                    """)
+            }
             lines.append(line)
             lines.sort { $0.start < $1.start } // interleave You/Others in spoken order
             autosave() // live checkpoint
         } catch {
-            NSLog("[Whispr] meeting chunk failed (\(speaker)): \(error)")
+            Log.audio.error("""
+                meeting chunk failed (\(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s): \
+                \(error.localizedDescription, privacy: .public)
+                """)
         }
     }
 

@@ -7,6 +7,21 @@ struct MeetingView: View {
     @State private var screenRecOK = CGPreflightScreenCaptureAccess()
     @State private var renames: [String: String] = [:]
 
+    /// Small labelled dot: green while audio buffers keep arriving on that stream, red once
+    /// they stop. Text carries the state too, so it does not rely on colour alone.
+    private func streamDot(_ label: String, healthy: Bool) -> some View {
+        HStack(spacing: 3) {
+            Circle()
+                .fill(healthy ? Color.green : Color.red)
+                .frame(width: 6, height: 6)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(healthy ? .secondary : Color.red)
+        }
+        .help(healthy ? "\(label): audio arriving" : "\(label): no audio arriving")
+        .accessibilityLabel("\(label) audio \(healthy ? "arriving" : "stopped")")
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -14,6 +29,12 @@ struct MeetingView: View {
                     .fill(controller.isRunning ? (controller.isPaused ? Color.orange : Color.red) : Color.secondary.opacity(0.4))
                     .frame(width: 9, height: 9)
                 Text(controller.status).font(.caption).foregroundStyle(.secondary)
+                if controller.isRunning {
+                    // Per-stream capture health. Without this a stalled stream is
+                    // indistinguishable from a room where nobody is talking.
+                    streamDot("You", healthy: controller.micHealthy)
+                    streamDot("Others", healthy: controller.systemHealthy)
+                }
                 Spacer()
                 Picker("Language", selection: $controller.meetingLanguage) {
                     ForEach(Languages.list, id: \.code) { lang in Text(lang.name).tag(lang.code ?? "auto") }

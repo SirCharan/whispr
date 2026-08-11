@@ -75,7 +75,8 @@ Headless self-checks:
 
 - First model load takes ~1–2 min (CoreML compiles for the Neural Engine once, then caches).
 - Models are cached under `~/Documents/huggingface/models/argmaxinc/whisperkit-coreml`.
-- Not yet code-signed/notarized — a signed DMG + Homebrew cask are planned.
+- **Not notarized, by choice.** Notarization needs a paid Apple Developer ID, which this project does not have, so there is no signed DMG and no Homebrew cask. The install step above (or `install.sh`, which clears the quarantine flag for you) is the supported route.
+- Builds are signed with a local self-signed identity so macOS keeps your microphone and Screen Recording grants across upgrades instead of asking again each time.
 
 ## License
 
