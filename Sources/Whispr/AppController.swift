@@ -19,6 +19,9 @@ final class AppController {
     private lazy var importModel = FileImportModel(transcriber: transcriber)
     private let corrections = CorrectionsWatcher()
     private let axWatcher = AXEditWatcher()
+    /// Silences other audio for the duration of a dictation. Dictation only — never meetings.
+    private let silencer = OutputSilencer()
+    private var silencerWatchdog: Timer?
     private var previewTimer: Timer?
     private var previewBusy = false
     private var previewTask: Task<Void, Never>?
@@ -39,6 +42,22 @@ final class AppController {
     func start() {
         Stats.syncOnLaunch() // restore aggregates from Application Support after a defaults wipe
         Self.migrateFromWhisprIfNeeded()
+        // A silence that outlived the last run (crash, force-quit) is undone here, before
+        // anything else can decide the device was "already muted" and leave it that way.
+        silencer.recoverAfterCrash()
+        // Backstop for tap-mode sessions that never end: restore after the watchdog window.
+        silencerWatchdog = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.silencer.expireIfStale(isRecording: self.recorder.isRecording)
+            }
+        }
+        // Sleep is a quit we do not control: restore before the machine goes down.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.silencer.restore() }
+        }
         NotificationCenter.default.addObserver(forName: .whisprHotkeyModeChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.modelReady else { return }
@@ -200,6 +219,14 @@ final class AppController {
     }
 
     /// Attach the active trigger: fn monitor (default) or the custom shortcut. Re-call on mode change.
+    /// Last chance before the process dies. Quit used to tear down nothing, which is harmless
+    /// for a recorder but not for a muted output device — that would survive us.
+    func shutdown() {
+        silencerWatchdog?.invalidate(); silencerWatchdog = nil
+        if recorder.isRecording { _ = recorder.stop() }
+        silencer.restore()
+    }
+
     func attachHotkeys() {
         if recorder.isRecording { stopDictation() } // never swap monitors mid-recording (drops the key-up)
         hotkeys = nil
@@ -259,12 +286,17 @@ final class AppController {
                 onStop: { [weak self] in self?.stopDictation() }
             )
             if Settings.soundCues { NSSound(named: "Pop")?.play() }
+            // Silence AFTER the cue (muting first would swallow our own Pop) and after the
+            // per-app-disabled return above, so a skipped dictation never leaves audio muted.
+            // Meetings are excluded: there, the system output IS the remote party we transcribe.
+            if !meetingCtrl.isRunning { silencer.silence() }
             idleWidget.hide() // the recording pill takes its spot
             setStatus("listening…")
             startPreviewLoop()
         } catch {
             setStatus("mic error")
             Log.audio.error("mic start failed: \(error.localizedDescription, privacy: .public)")
+            silencer.restore() // never strand the output on a failed start
         }
     }
 
@@ -303,6 +335,7 @@ final class AppController {
         guard recorder.isRecording else { return }
         stopPreviewLoop()
         _ = recorder.stop()
+        silencer.restore()
         menuBar.setRecording(false)
         indicator.hide()
         idleWidget.show()
@@ -325,6 +358,7 @@ final class AppController {
         guard recorder.isRecording else { return }
         stopPreviewLoop()
         let samples = recorder.stop()
+        silencer.restore() // before the Tink, so the cue is audible again
         menuBar.setRecording(false)
         indicator.hide()
         idleWidget.show()

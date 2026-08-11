@@ -12,6 +12,7 @@ enum Whispr {
             setvbuf(stdout, nil, _IONBF, 0)
             WavEncoder.selfTest()
             ResamplingBuffer.selfTest()
+            OutputSilencer.selfTest()
             TextProcessor.selfTest()
             DictionaryStore.selfTest()
             SnippetStore.selfTest()
@@ -47,6 +48,10 @@ enum Whispr {
         }
         if let i = args.firstIndex(of: "--diarize-test"), i + 1 < args.count {
             runDiarizeTest(path: args[i + 1])
+            exit(0)
+        }
+        if args.contains("--mute-test") {
+            runMuteTest()
             exit(0)
         }
 
@@ -178,21 +183,94 @@ enum Whispr {
         dispatchMain()
     }
 
-    /// Load the selected model (cached) and transcribe an audio file. Proves the full ASR path.
+    /// Exercise the real CoreAudio mute path and verify it restores. Prints every step, so a
+    /// device that acknowledges a write and ignores it is visible here rather than after the
+    /// user has been left with a silent Mac.
+    private static func runMuteTest() {
+        guard let device = OutputAudio.defaultOutputDevice() else {
+            print("mute-test FAIL: no default output device")
+            return
+        }
+        let supported = OutputAudio.muteSupported(device)
+        let startedMuted = OutputAudio.isMuted(device)
+        let startVolume = OutputAudio.volume(device)
+        print("""
+            mute-test: device=\(device) muteSupported=\(supported) \
+            alreadyMuted=\(startedMuted) volume=\(startVolume.map { String(format: "%.2f", $0) } ?? "n/a") \
+            playing=\(OutputAudio.isRunningSomewhere(device))
+            """)
+        if startedMuted {
+            print("mute-test SKIP: device is already muted — unmute it and re-run")
+            return
+        }
+
+        var ok = true
+        if supported {
+            OutputAudio.setMute(device, true)
+            let muted = OutputAudio.isMuted(device)
+            print("mute-test: after setMute(true) isMuted=\(muted)")
+            if !muted { ok = false; print("mute-test WARN: device ignored the mute write") }
+            OutputAudio.setMute(device, false)
+            let restored = !OutputAudio.isMuted(device)
+            print("mute-test: after setMute(false) isMuted=\(!restored)")
+            if !restored { ok = false; print("mute-test WARN: device did not unmute") }
+        } else {
+            guard let start = startVolume else {
+                print("mute-test FAIL: no mute and no volume property — nothing to drive")
+                return
+            }
+            OutputAudio.setVolume(device, 0)
+            let zeroed = (OutputAudio.volume(device) ?? 1) <= 0.01
+            print("mute-test: after setVolume(0) zeroed=\(zeroed)")
+            OutputAudio.setVolume(device, start)
+            let back = OutputAudio.volume(device) ?? -1
+            print("mute-test: volume restored to \(String(format: "%.2f", back)) (was \(String(format: "%.2f", start)))")
+            if !zeroed || abs(back - start) > 0.02 { ok = false }
+        }
+        print(ok ? "mute-test PASS" : "mute-test FAIL")
+    }
+
+    /// Value of a `--flag value` pair anywhere in the argument list.
+    private static func flagValue(_ name: String) -> String? {
+        let args = CommandLine.arguments
+        guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
+        let v = args[i + 1]
+        return v.hasPrefix("--") ? nil : v
+    }
+
+    /// Load a model (cached) and transcribe an audio file. Proves the full ASR path.
+    ///
+    /// `--model` and `--lang` override the saved settings, which is what makes a model A/B on
+    /// the same recording possible — the only way to settle whether turbo costs real accuracy
+    /// on a given language, since published per-language numbers for the distilled model are
+    /// scarce and inconsistent:
+    ///
+    ///   --transcribe-file clip.wav --model large-v3-v20240930_turbo --lang hi
+    ///   --transcribe-file clip.wav --model large-v3 --lang hi
+    ///
     /// Drives the main queue via `dispatchMain()` so the @MainActor work runs (never block main with a semaphore).
     private static func runTranscribeFile(path: String) {
         Task { @MainActor in
             let mm = ModelManager()
-            let model = mm.selectedModel
+            let model = flagValue("--model") ?? mm.selectedModel
+            let language = flagValue("--lang") ?? Settings.languageCode
             let transcriber = Transcriber()
             do {
+                let started = Date()
                 let folder = try await mm.ensureDownloaded(model) { _ in }
+                let loaded = Date()
                 try await transcriber.load(model: model, folder: folder)
-                var text = try await transcriber.transcribeFile(path, language: Settings.languageCode)
+                var text = try await transcriber.transcribeFile(path, language: language)
                 if Settings.outputMode == "roman" { text = Transliterate.toLatin(text) }
-                print("transcribe-file: \"\(text)\"")
+                let elapsed = Date().timeIntervalSince(loaded)
+                print("""
+                    transcribe-file: model=\(model) lang=\(language ?? "auto") \
+                    load=\(String(format: "%.1f", loaded.timeIntervalSince(started)))s \
+                    transcribe=\(String(format: "%.1f", elapsed))s
+                    "\(text)"
+                    """)
             } catch {
-                print("transcribe-file FAIL: \(error)")
+                print("transcribe-file FAIL (model=\(model)): \(error)")
             }
             exit(0)
         }
@@ -213,5 +291,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         controller?.showMainWindow()
         return true
+    }
+
+    /// Quitting while dictating must not leave the output device muted.
+    func applicationWillTerminate(_ notification: Notification) {
+        controller?.shutdown()
     }
 }

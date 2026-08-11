@@ -404,11 +404,8 @@ private struct ModelsPane: View {
                 }
                 Text("Switching downloads the model if needed, then reloads. Turbo = best accuracy; tiny/base = fastest.")
                     .font(.caption).foregroundStyle(.secondary)
-                if let tip = ModelManager.recommendation(language: language, selected: model) {
-                    Label(tip, systemImage: "lightbulb")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
+                Text("large-v3 is the full model turbo was distilled from. It is slower and a bigger download; whether it transcribes your language better is worth testing rather than assuming.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Language") {
                 Picker("Spoken language", selection: $language) {
