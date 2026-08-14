@@ -2,7 +2,7 @@
 
 Local-first dictation and meeting transcription for macOS. Speech never leaves your Mac.
 
-100% on-device via [WhisperKit](https://github.com/argmaxinc/WhisperKit) (Whisper on the Apple Neural Engine). No cloud, no account, no audio upload — unlike Wispr Flow, which transcribes in the cloud. Closest open-source sibling: [Muesli](https://github.com/Muesli-HQ/muesli).
+100% on-device via [WhisperKit](https://github.com/argmaxinc/WhisperKit) (Whisper on the Apple Neural Engine). No cloud, no account, no audio upload — unlike Wispr Flow, which transcribes in the cloud (per its subprocessor list, Aug 2026). Closest open-source sibling: [Muesli](https://github.com/Muesli-HQ/muesli).
 
 ## Requirements
 
@@ -56,8 +56,8 @@ curl -fsSL https://openwispr.vercel.app/install.sh | sh
 
 **Or manually:**
 
-1. Download `OpenWispr.dmg` (or unzip `OpenWispr.zip`).
-2. Move it to `/Applications`.
+1. Download `OpenWispr.dmg` from the [latest release](https://github.com/SirCharan/openwispr/releases/latest).
+2. Open the DMG and drag `OpenWispr.app` to `/Applications`.
 3. First launch: macOS shows **"OpenWispr" Not Opened** (the build is not notarized). Click **Done**, open **System Settings → Privacy & Security**, scroll to "OpenWispr was blocked", click **Open Anyway**. Terminal alternative: `xattr -dr com.apple.quarantine /Applications/OpenWispr.app`.
 4. OpenWispr lives in the menu bar (mic icon), not the Dock. Clicking the app in Applications opens its home window. A setup wizard runs on first launch.
 
@@ -73,7 +73,7 @@ curl -fsSL https://openwispr.vercel.app/install.sh | sh
 
 ## Tunables
 
-Settings not exposed in the UI, set via `defaults write org.openwispr.app <key> <value>`:
+Settings not exposed in the UI, set via `defaults write org.openwispr.app <key> <type> <value>` — for example `defaults write org.openwispr.app meetingSpeechFloor -float 0.008`:
 
 | Key | Type | Default | What it does |
 |---|---|---|---|

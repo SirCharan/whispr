@@ -27,7 +27,7 @@ Notable changes to OpenWispr (formerly Whispr), newest first.
 ## [0.16.0] - 2026-08-05
 - Reworked onboarding: a personalize step, and a welcome-back flow for people reinstalling.
 - Insights now survive reinstalls (stored in Application Support instead of app-local storage).
-- Removed the on-device Apple Intelligence cleanup path; BYOK cleanup (Ollama/OpenAI) is unaffected.
+- Removed the on-device Apple Intelligence cleanup path — it underdelivered; BYOK cleanup (Ollama/OpenAI) is unaffected.
 
 ## [0.15.0] - 2026-08-04
 - First-run wizard cut from 12 steps to 7, in three phases: Permissions, Model, Dictate.
@@ -57,7 +57,7 @@ Notable changes to OpenWispr (formerly Whispr), newest first.
 - Repeated-word hallucination loops in transcripts are now collapsed.
 
 ## [0.10.4] - 2026-07-27
-- Added the "medium" Whisper model as the best on-shelf choice for Hindi (or any language) to English translation.
+- Added the "medium" Whisper model, the strongest available option for Hindi (or any language) to English translation.
 
 ## [0.10.3] - 2026-07-27
 - Dictionary rows are now editable in place, with inline save/cancel and delete.
