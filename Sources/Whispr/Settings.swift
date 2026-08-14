@@ -58,8 +58,12 @@ enum Settings {
     ///
     /// One meeting is one room and one mic gain, so this is a knob, not a law:
     /// `defaults write org.openwispr.app meetingSpeechFloor -float 0.008` to loosen it.
+    /// The calibrated default, kept separate from the tunable value so self-tests can assert
+    /// the calibration corpus without trapping on a user's `defaults write` override.
+    static let defaultMeetingSpeechFloor = 0.015
+
     static var meetingSpeechFloor: Double {
-        get { UserDefaults.standard.object(forKey: "meetingSpeechFloor") as? Double ?? 0.015 }
+        get { UserDefaults.standard.object(forKey: "meetingSpeechFloor") as? Double ?? defaultMeetingSpeechFloor }
         set { UserDefaults.standard.set(newValue, forKey: "meetingSpeechFloor") }
     }
 

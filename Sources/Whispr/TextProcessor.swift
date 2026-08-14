@@ -81,7 +81,7 @@ enum TextProcessor {
     /// Matching is whole-line only, after stripping punctuation. A line that merely *contains*
     /// "thank you" is real speech and is kept. Meetings only — in dictation "Thank you." is a
     /// legitimate thing to say, and deleting it would be the worse failure.
-    static func isHallucinatedFiller(_ text: String) -> Bool {
+    static func isHallucinatedFiller(_ text: String, chunkDuration: Double = .infinity) -> Bool {
         let normalized = text.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
@@ -89,13 +89,19 @@ enum TextProcessor {
         guard !normalized.isEmpty else { return true }
 
         // Longest first, so "thank you very much" is stripped before "thank you".
-        let fillers = [
+        var fillers = [
             ["subtitles", "by", "the", "amara", "org", "community"],
             ["thanks", "for", "watching"], ["thank", "you", "for", "watching"],
             ["thank", "you", "very", "much"], ["muchas", "gracias"],
             ["please", "subscribe"], ["thank", "you"],
-            ["gracias"], ["thanks"], ["bye"], ["goodbye"], ["you"],
         ]
+        // A lone word is only hallucination when the chunk is long: eight-plus seconds of audio
+        // yielding one token is Whisper filling silence, but a two-second chunk of "Bye." or
+        // "You?" is someone talking — deleting that is the exact incident the echo-dedup removal
+        // was about. Short chunks keep their single words.
+        if chunkDuration > 8 {
+            fillers += [["gracias"], ["thanks"], ["bye"], ["goodbye"], ["you"]]
+        }
         // Repeatedly peel a filler phrase off the front. "Thank you. Thank you." reduces to
         // nothing and is filler; "Thank you Ravi" leaves "ravi" and is kept.
         var rest = normalized[...]
@@ -153,6 +159,15 @@ enum TextProcessor {
         for t in keep {
             Fixtures.expect(!isHallucinatedFiller(t), "should be kept: \"\(t)\"")
         }
-        print("TextProcessor.selfTest PASS (\(f.process.count + f.collapseRepeats.count + filler.count + keep.count) cases)")
+        // The lone-word gate: a short chunk of "Bye." or "You?" is real speech and survives;
+        // the same word out of a long chunk is Whisper filling silence. Multi-word filler and
+        // punctuation-only lines are dropped at any duration.
+        for t in ["You?", "Bye.", "Thanks!", "Bye bye"] {
+            Fixtures.expect(!isHallucinatedFiller(t, chunkDuration: 2), "short chunk should keep: \"\(t)\"")
+            Fixtures.expect(isHallucinatedFiller(t, chunkDuration: 20), "long chunk should drop: \"\(t)\"")
+        }
+        Fixtures.expect(isHallucinatedFiller("Thank you.", chunkDuration: 2), "multi-word filler dropped at any duration")
+        Fixtures.expect(isHallucinatedFiller("...", chunkDuration: 2), "punctuation-only dropped at any duration")
+        print("TextProcessor.selfTest PASS (\(f.process.count + f.collapseRepeats.count + filler.count + keep.count + 10) cases)")
     }
 }

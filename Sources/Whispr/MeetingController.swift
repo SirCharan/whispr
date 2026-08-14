@@ -44,6 +44,8 @@ final class MeetingController: ObservableObject {
     /// Read from Settings so a quiet room can be tuned without a rebuild — see
     /// `Settings.meetingSpeechFloor` for the measurements behind the default.
     private var speechPeakRMS: Float { Float(Settings.meetingSpeechFloor) }
+    /// Chunks dropped below the speech floor this meeting; reported once at stop.
+    private var floorDrops = 0
 
     /// Meeting cleanup keeps capitalization and spacing but never deletes words.
     static let meetingTextOptions = TextProcessor.Options(removeFillers: false, cleanUp: true)
@@ -294,6 +296,12 @@ final class MeetingController: ObservableObject {
         await flushPending()
         closeAudioWriters()
         await applyDiarization()
+        // The floor is calibrated on one room and one mic gain. A high drop count is the signal
+        // to loosen `meetingSpeechFloor` — surfaced here so the user doesn't need Console.app.
+        if floorDrops > 0 {
+            Log.audio.info("meeting ended: \(self.floorDrops, privacy: .public) chunk(s) dropped below the speech floor \(self.speechPeakRMS, format: .fixed(precision: 4), privacy: .public) — if quiet speech is missing, lower meetingSpeechFloor")
+        }
+        floorDrops = 0
         status = "done"
         if !lines.isEmpty {
             Stats.recordMeeting()
@@ -425,16 +433,18 @@ final class MeetingController: ObservableObject {
         // maxWindowRMS values from the 11 Aug 2026 meeting: the four chunks that produced
         // "Gracias." / "Thank you." hallucinations, and the quietest chunks that carried actual
         // speech on each stream. A floor that fails either side is the bug coming back.
-        let floor = Float(Settings.meetingSpeechFloor)
+        // Assert against the calibrated DEFAULT, not the live tunable — a user who follows the
+        // documented `defaults write … meetingSpeechFloor` advice must not crash `--selftest`.
+        let floor = Float(Settings.defaultMeetingSpeechFloor)
         // Mic chunks 0.00287–0.00925 all returned filler; the 0.01435 system chunk returned ".".
         let hallucinatedNoise: [Float] = [0.00287, 0.00545, 0.00570, 0.00791, 0.00862, 0.00925, 0.01435]
         // Quietest chunks that carried real words: 0.02542 system, 0.03029 mic.
         let realSpeech: [Float] = [0.02542, 0.03029, 0.04511, 0.05176, 0.05944]
         for n in hallucinatedNoise {
-            precondition(n <= floor, "noise \(n) clears the speech floor \(floor) — Whisper will hallucinate on it")
+            Fixtures.expect(n <= floor, "noise \(n) clears the speech floor \(floor) — Whisper will hallucinate on it")
         }
         for s in realSpeech {
-            precondition(s > floor, "real speech \(s) falls below the speech floor \(floor) — it would be silently dropped")
+            Fixtures.expect(s > floor, "real speech \(s) falls below the speech floor \(floor) — it would be silently dropped")
         }
         print("MeetingController.selfTest PASS")
     }
@@ -485,6 +495,7 @@ final class MeetingController: ObservableObject {
         // mechanism behind the multi-minute blank gaps. Both levels are logged so the
         // threshold can be set from real meeting data rather than guessed.
         guard peakRMS > speechPeakRMS else {
+            floorDrops += 1
             Log.audio.info("""
                 drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — \
                 below speech floor (peak \(peakRMS, format: .fixed(precision: 4), privacy: .public) \
@@ -507,7 +518,7 @@ final class MeetingController: ObservableObject {
             // The speech floor cannot catch a loud chunk that is loud with the *other* side's
             // voice bleeding out of the speakers — 16 of these survived the gate on 11 Aug.
             // Whole-line filler only, so real speech containing "thank you" is untouched.
-            guard !TextProcessor.isHallucinatedFiller(text) else {
+            guard !TextProcessor.isHallucinatedFiller(text, chunkDuration: duration) else {
                 Log.audio.info("""
                     drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — \
                     whole-line filler "\(text, privacy: .public)" (peak \(peakRMS, format: .fixed(precision: 4), privacy: .public))
