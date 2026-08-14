@@ -70,6 +70,45 @@ enum TextProcessor {
         return out.joined(separator: " ")
     }
 
+    /// Whole-line Whisper null-output, as opposed to something anyone said.
+    ///
+    /// Given ~30 s of near-silence or muffled speaker bleed, Whisper does not return an empty
+    /// string — it returns the most common phrase in its training data. The 11 Aug 2026 meeting
+    /// collected 16 of these on the mic stream alone, all inside chunks that were genuinely loud
+    /// with the *remote* participant's voice leaking through the laptop speakers. A level gate
+    /// cannot catch those: the chunk has energy, ck simply is not talking.
+    ///
+    /// Matching is whole-line only, after stripping punctuation. A line that merely *contains*
+    /// "thank you" is real speech and is kept. Meetings only — in dictation "Thank you." is a
+    /// legitimate thing to say, and deleting it would be the worse failure.
+    static func isHallucinatedFiller(_ text: String) -> Bool {
+        let normalized = text.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        // Punctuation-only lines (".", "-", "- -", "...") carry nothing.
+        guard !normalized.isEmpty else { return true }
+
+        // Longest first, so "thank you very much" is stripped before "thank you".
+        let fillers = [
+            ["subtitles", "by", "the", "amara", "org", "community"],
+            ["thanks", "for", "watching"], ["thank", "you", "for", "watching"],
+            ["thank", "you", "very", "much"], ["muchas", "gracias"],
+            ["please", "subscribe"], ["thank", "you"],
+            ["gracias"], ["thanks"], ["bye"], ["goodbye"], ["you"],
+        ]
+        // Repeatedly peel a filler phrase off the front. "Thank you. Thank you." reduces to
+        // nothing and is filler; "Thank you Ravi" leaves "ravi" and is kept.
+        var rest = normalized[...]
+        outer: while !rest.isEmpty {
+            for f in fillers where rest.starts(with: f) {
+                rest = rest.dropFirst(f.count)
+                continue outer
+            }
+            return false
+        }
+        return true
+    }
+
     /// Driven by `core/fixtures/text.json`, the same table the Rust port is held to.
     private struct FixtureFile: Decodable {
         struct ProcessCase: Decodable {
@@ -96,6 +135,24 @@ enum TextProcessor {
         for c in f.collapseRepeats {
             Fixtures.expectEqual(collapseRepeats(c.input), c.expected, "collapseRepeats(\(c.input))")
         }
-        print("TextProcessor.selfTest PASS (\(f.process.count + f.collapseRepeats.count) cases)")
+        // Every one of these `true` cases is a real line from the 11 Aug 2026 meeting transcript.
+        // The `false` cases are the ones that must survive: deleting a real line is unrecoverable,
+        // a stray "Thank you." is merely untidy, so this filter errs toward keeping.
+        let filler = ["Thank you.", "Thank you..", "Thank you. Thank you.", "Gracias.", ".", "-", "- -", "...", "  ", "Bye bye"]
+        // Devanagari must survive: ck speaks Hinglish, and `alphanumerics` is Unicode-aware, so
+        // these are NOT reduced to an empty token list. A regex over [a-z] would delete them all.
+        let keep = ["Thank you Ravi", "Thank you, that answers it", "You are on mute, right?",
+                    "So, two, three questions here. Am I audible, first of all?", "Tika.", "Those are many",
+                    "भाई चिराग थो जल्दी कर सके हैं आफ टो गो आउट डिनर टाइम",
+                    "जो लोग जमीन से जूड़ी होते हैं वोग बहुत कामी मूब करते हैं",
+                    "तो मुझे अभी 25,000 ले बागी पर बाद मैं कर लियो",
+                    "谢谢大家", "ありがとう"]
+        for t in filler {
+            Fixtures.expect(isHallucinatedFiller(t), "should be filler: \"\(t)\"")
+        }
+        for t in keep {
+            Fixtures.expect(!isHallucinatedFiller(t), "should be kept: \"\(t)\"")
+        }
+        print("TextProcessor.selfTest PASS (\(f.process.count + f.collapseRepeats.count + filler.count + keep.count) cases)")
     }
 }

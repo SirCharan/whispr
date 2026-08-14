@@ -48,6 +48,21 @@ enum Settings {
         set { UserDefaults.standard.set(newValue, forKey: "meetingAudioRetentionDays") }
     }
 
+    /// Loudest-half-second RMS a meeting chunk must reach before it is sent to Whisper.
+    ///
+    /// Measured on the 19-minute meeting of 11 Aug 2026 (39 chunks per stream): room tone plus
+    /// speaker bleed peaks at 0.0029–0.0093, while real speech peaks at 0.059–0.200 on the mic
+    /// and above 0.020 on the system stream. Nothing lands in between. The old 0.0035 floor sat
+    /// inside the noise band, so 97% of chunks reached Whisper and the silent ones came back as
+    /// "Thank you." / "Gracias." — Whisper fills near-silence with training-set filler.
+    ///
+    /// One meeting is one room and one mic gain, so this is a knob, not a law:
+    /// `defaults write org.openwispr.app meetingSpeechFloor -float 0.008` to loosen it.
+    static var meetingSpeechFloor: Double {
+        get { UserDefaults.standard.object(forKey: "meetingSpeechFloor") as? Double ?? 0.015 }
+        set { UserDefaults.standard.set(newValue, forKey: "meetingSpeechFloor") }
+    }
+
     /// Show the small persistent floating mic pill (click to dictate).
     static var showIdleWidget: Bool {
         get { UserDefaults.standard.object(forKey: "showIdleWidget") as? Bool ?? true }

@@ -41,7 +41,9 @@ final class MeetingController: ObservableObject {
     private let pauseWindow = 0.7
     private let pauseRMS: Float = 0.004
     /// Speech floor applied to the loudest half-second of a chunk (not its mean).
-    private let speechPeakRMS: Float = 0.0035
+    /// Read from Settings so a quiet room can be tuned without a rebuild — see
+    /// `Settings.meetingSpeechFloor` for the measurements behind the default.
+    private var speechPeakRMS: Float { Float(Settings.meetingSpeechFloor) }
 
     /// Meeting cleanup keeps capitalization and spacing but never deletes words.
     static let meetingTextOptions = TextProcessor.Options(removeFillers: false, cleanUp: true)
@@ -418,6 +420,22 @@ final class MeetingController: ObservableObject {
                            line("now we can go to the call", 7, 12)), "different text flagged")
         precondition(!isEchoPair(line("we should add a card", 0, 5),
                            line("we should add a card", 40, 45)), "non-overlapping flagged")
+
+        // The speech floor must sit in the empty band between noise and speech. These are real
+        // maxWindowRMS values from the 11 Aug 2026 meeting: the four chunks that produced
+        // "Gracias." / "Thank you." hallucinations, and the quietest chunks that carried actual
+        // speech on each stream. A floor that fails either side is the bug coming back.
+        let floor = Float(Settings.meetingSpeechFloor)
+        // Mic chunks 0.00287–0.00925 all returned filler; the 0.01435 system chunk returned ".".
+        let hallucinatedNoise: [Float] = [0.00287, 0.00545, 0.00570, 0.00791, 0.00862, 0.00925, 0.01435]
+        // Quietest chunks that carried real words: 0.02542 system, 0.03029 mic.
+        let realSpeech: [Float] = [0.02542, 0.03029, 0.04511, 0.05176, 0.05944]
+        for n in hallucinatedNoise {
+            precondition(n <= floor, "noise \(n) clears the speech floor \(floor) — Whisper will hallucinate on it")
+        }
+        for s in realSpeech {
+            precondition(s > floor, "real speech \(s) falls below the speech floor \(floor) — it would be silently dropped")
+        }
         print("MeetingController.selfTest PASS")
     }
 
@@ -484,6 +502,16 @@ final class MeetingController: ObservableObject {
             let text = TextProcessor.process(raw, options: Self.meetingTextOptions)
             guard !text.isEmpty else {
                 Log.audio.info("drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — empty after cleanup (raw was \(raw.count) chars)")
+                return
+            }
+            // The speech floor cannot catch a loud chunk that is loud with the *other* side's
+            // voice bleeding out of the speakers — 16 of these survived the gate on 11 Aug.
+            // Whole-line filler only, so real speech containing "thank you" is untouched.
+            guard !TextProcessor.isHallucinatedFiller(text) else {
+                Log.audio.info("""
+                    drop \(which, privacy: .public) t=\(start, format: .fixed(precision: 1), privacy: .public)s — \
+                    whole-line filler "\(text, privacy: .public)" (peak \(peakRMS, format: .fixed(precision: 4), privacy: .public))
+                    """)
                 return
             }
             let line = MeetingLine(speaker: speaker, text: text, start: start, end: start + duration)
